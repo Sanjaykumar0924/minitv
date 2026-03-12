@@ -1,4 +1,4 @@
-import { useEffect, useRef, useImperativeHandle, forwardRef } from "react";
+import { useEffect, useRef, useImperativeHandle, forwardRef, useCallback } from "react";
 import {
   createChart,
   type IChartApi,
@@ -45,15 +45,16 @@ const NiftyChart = forwardRef<NiftyChartHandle, NiftyChartProps>(
     const chartRef = useRef<IChartApi | null>(null);
     const seriesRef = useRef<ISeriesApi<SeriesType> | null>(null);
     const lastDataRef = useRef<OHLCData | null>(null);
-    const preservedRangeRef = useRef<{ from: number; to: number } | null>(null);
+    const overlaySeriesRef = useRef<ISeriesApi<SeriesType>[]>([]);
+    const initialFocusDoneRef = useRef(false);
 
-    const focusLatestRange = (bars = 120) => {
+    const focusLatestRange = useCallback((bars = 120) => {
       if (!chartRef.current || data.length === 0) return;
       const to = data.length - 1;
       const from = Math.max(0, to - bars);
       chartRef.current.timeScale().setVisibleLogicalRange({ from, to: to + 2 });
       chartRef.current.timeScale().scrollToRealTime();
-    };
+    }, [data.length]);
 
     useImperativeHandle(ref, () => ({
       updateLastCandle: (price: number) => {
@@ -77,8 +78,9 @@ const NiftyChart = forwardRef<NiftyChartHandle, NiftyChartProps>(
       },
     }));
 
+    // ── Effect 1: Chart instance creation (depends only on chartType) ──
     useEffect(() => {
-      if (!chartContainerRef.current || data.length === 0) return;
+      if (!chartContainerRef.current) return;
       const container = chartContainerRef.current;
 
       const chart = createChart(container, {
@@ -97,13 +99,19 @@ const NiftyChart = forwardRef<NiftyChartHandle, NiftyChartProps>(
         handleScale: {
           axisPressedMouseMove: { time: true, price: true },
           axisDoubleClickReset: { time: true, price: true },
-          mouseWheel: true, pinch: true,
+          mouseWheel: true,
+          pinch: true,
         },
         crosshair: {
           vertLine: { color: "hsl(142, 60%, 45%)", width: 1, style: 2 },
           horzLine: { color: "hsl(142, 60%, 45%)", width: 1, style: 2 },
         },
-        timeScale: { borderColor: "hsl(220, 14%, 18%)", timeVisible: true, secondsVisible: false, shiftVisibleRangeOnNewBar: true },
+        timeScale: {
+          borderColor: "hsl(220, 14%, 18%)",
+          timeVisible: true,
+          secondsVisible: false,
+          shiftVisibleRangeOnNewBar: true,
+        },
         localization: {
           timeFormatter: (time: number) => {
             const d = new Date((time + 19800) * 1000);
@@ -116,10 +124,10 @@ const NiftyChart = forwardRef<NiftyChartHandle, NiftyChartProps>(
       });
 
       chartRef.current = chart;
-      lastDataRef.current = data[data.length - 1];
+      initialFocusDoneRef.current = false;
 
+      // Create main series
       let mainSeries: ISeriesApi<SeriesType>;
-
       if (chartType === "candlestick") {
         const series = chart.addSeries(CandlestickSeries, {
           upColor: "hsl(142, 60%, 45%)",
@@ -129,18 +137,47 @@ const NiftyChart = forwardRef<NiftyChartHandle, NiftyChartProps>(
           wickUpColor: "hsl(142, 60%, 45%)",
           wickDownColor: "hsl(0, 72%, 55%)",
         });
-        series.setData(data as CandlestickData[]);
         mainSeries = series as unknown as ISeriesApi<SeriesType>;
       } else {
         const series = chart.addSeries(LineSeries, {
           color: "hsl(142, 60%, 45%)",
           lineWidth: 2,
         });
-        series.setData(data.map((d) => ({ time: d.time, value: d.close })) as LineData[]);
         mainSeries = series as unknown as ISeriesApi<SeriesType>;
       }
-
       seriesRef.current = mainSeries;
+
+      const handleResize = () => {
+        chart.applyOptions({ width: container.clientWidth });
+      };
+      window.addEventListener("resize", handleResize);
+
+      return () => {
+        window.removeEventListener("resize", handleResize);
+        chart.remove();
+        chartRef.current = null;
+        seriesRef.current = null;
+        overlaySeriesRef.current = [];
+        initialFocusDoneRef.current = false;
+      };
+    }, [chartType]);
+
+    // ── Effect 2: Data & overlay updates (preserves zoom/scroll) ──
+    useEffect(() => {
+      const chart = chartRef.current;
+      const mainSeries = seriesRef.current;
+      if (!chart || !mainSeries || data.length === 0) return;
+
+      // Save current visible time range before updating
+      const savedRange = chart.timeScale().getVisibleRange();
+
+      // Update main series data
+      if (chartType === "candlestick") {
+        mainSeries.setData(data as CandlestickData[]);
+      } else {
+        mainSeries.setData(data.map((d) => ({ time: d.time, value: d.close })) as LineData[]);
+      }
+      lastDataRef.current = data[data.length - 1];
 
       // ── Signal markers ──
       const allMarkers: Array<{
@@ -152,20 +189,17 @@ const NiftyChart = forwardRef<NiftyChartHandle, NiftyChartProps>(
         size: number;
       }> = [];
 
-      if (signals.length > 0) {
-        for (const sig of signals) {
-          allMarkers.push({
-            time: sig.time as unknown as Time,
-            position: sig.direction === "bullish" ? "belowBar" : "aboveBar",
-            color: "#FFD700",
-            shape: sig.direction === "bullish" ? "arrowUp" : "arrowDown",
-            text: sig.pattern,
-            size: 2,
-          });
-        }
+      for (const sig of signals) {
+        allMarkers.push({
+          time: sig.time as unknown as Time,
+          position: sig.direction === "bullish" ? "belowBar" : "aboveBar",
+          color: "#FFD700",
+          shape: sig.direction === "bullish" ? "arrowUp" : "arrowDown",
+          text: sig.pattern,
+          size: 2,
+        });
       }
 
-      // ── Breakout markers from advanced trendlines ──
       for (const tl of advancedTrendlines) {
         if (tl.broken && tl.breakoutIndex !== undefined && tl.breakoutIndex < data.length) {
           allMarkers.push({
@@ -194,6 +228,12 @@ const NiftyChart = forwardRef<NiftyChartHandle, NiftyChartProps>(
         createSeriesMarkers(mainSeries, allMarkers);
       }
 
+      // ── Remove old overlay series ──
+      for (const s of overlaySeriesRef.current) {
+        chart.removeSeries(s);
+      }
+      overlaySeriesRef.current = [];
+
       // ── Support/Resistance horizontal lines ──
       for (const sr of srLevels) {
         const color = sr.type === "support" ? "hsl(210, 80%, 55%)" : "hsl(330, 80%, 55%)";
@@ -205,23 +245,22 @@ const NiftyChart = forwardRef<NiftyChartHandle, NiftyChartProps>(
           priceLineVisible: false,
           lastValueVisible: true,
         });
-
         const firstTime = data[0].time;
         const lastTime = data[data.length - 1].time;
         srSeries.setData([
           { time: firstTime, value: sr.price },
           { time: lastTime, value: sr.price },
         ] as LineData[]);
+        overlaySeriesRef.current.push(srSeries as unknown as ISeriesApi<SeriesType>);
       }
 
-      // ── Advanced Trendlines with extension & prediction ──
+      // ── Advanced Trendlines ──
       for (const tl of advancedTrendlines) {
         if (tl.points.length < 2) continue;
 
-        // Color: green for support, red for resistance
         let color: string;
         let lineWidth: 1 | 2 | 3 | 4 = 2;
-        let lineStyle: number = 0; // solid
+        let lineStyle: number = 0;
 
         if (tl.type === "support") {
           color = tl.broken ? "hsla(142, 60%, 45%, 0.3)" : "hsl(142, 60%, 45%)";
@@ -230,7 +269,7 @@ const NiftyChart = forwardRef<NiftyChartHandle, NiftyChartProps>(
         }
 
         if (tl.category === "horizontal_support" || tl.category === "horizontal_resistance") {
-          lineStyle = 1; // dashed
+          lineStyle = 1;
           lineWidth = 1;
         }
 
@@ -245,48 +284,48 @@ const NiftyChart = forwardRef<NiftyChartHandle, NiftyChartProps>(
 
         const p1 = tl.points[0];
         const pLast = tl.points[tl.points.length - 1];
-
         const lineData: LineData[] = [
           { time: p1.time as unknown as Time, value: p1.value },
           { time: pLast.time as unknown as Time, value: pLast.value },
         ];
 
-        // Extended projection into the future
         if (tl.extended.time > pLast.time) {
           lineData.push({ time: tl.extended.time as unknown as Time, value: tl.extended.value });
         }
 
         tlSeries.setData(lineData);
+        overlaySeriesRef.current.push(tlSeries as unknown as ISeriesApi<SeriesType>);
       }
 
-      // Handle signal click
-      if (onSignalClick && signals.length > 0) {
-        chart.subscribeClick((param) => {
-          if (!param.time) return;
-          const clickTime = param.time as number;
-          const matched = signals.find((s) => s.time === clickTime);
-          if (matched) onSignalClick(matched);
-        });
-      }
-
-      if (preservedRangeRef.current) {
-        chart.timeScale().setVisibleLogicalRange(preservedRangeRef.current);
+      // ── Restore zoom/scroll or do initial focus ──
+      if (savedRange && initialFocusDoneRef.current) {
+        chart.timeScale().setVisibleRange(savedRange);
       } else {
-        focusLatestRange();
+        const to = data.length - 1;
+        const from = Math.max(0, to - 120);
+        chart.timeScale().setVisibleLogicalRange({ from, to: to + 2 });
+        chart.timeScale().scrollToRealTime();
+        initialFocusDoneRef.current = true;
       }
+    }, [data, chartType, signals, advancedTrendlines, srLevels]);
 
-      const handleResize = () => {
-        chart.applyOptions({ width: container.clientWidth });
+    // ── Effect 3: Signal click handler ──
+    useEffect(() => {
+      const chart = chartRef.current;
+      if (!chart || !onSignalClick || signals.length === 0) return;
+
+      const handler = (param: { time?: Time }) => {
+        if (!param.time) return;
+        const clickTime = param.time as number;
+        const matched = signals.find((s) => s.time === clickTime);
+        if (matched) onSignalClick(matched);
       };
-      window.addEventListener("resize", handleResize);
 
+      chart.subscribeClick(handler);
       return () => {
-        preservedRangeRef.current = chart.timeScale().getVisibleLogicalRange();
-        window.removeEventListener("resize", handleResize);
-        chart.remove();
-        seriesRef.current = null;
+        chart.unsubscribeClick(handler);
       };
-    }, [data, chartType, signals, advancedTrendlines, srLevels, onSignalClick]);
+    }, [onSignalClick, signals]);
 
     return <div ref={chartContainerRef} className="w-full h-full" />;
   }
